@@ -19,7 +19,7 @@ Con esta guía podrás:
 3. **Filtrar por usuario** (por ejemplo `user21`) y por tipo de operación.
 4. Distinguir acciones desde la **consola web** frente a la **CLI** (`oc`).
 5. Identificar intentos **permitidos** y **denegados** (código HTTP 403).
-6. Determinar **quién eliminó un proyecto** (namespace).
+6. Determinar **quién creó o eliminó un proyecto**.
 
 ---
 
@@ -57,6 +57,7 @@ Cada línea del log es un JSON con campos como:
 | `userAgent`                                           | Cliente: `oc/4.x`, navegador (`Mozilla/...`), `curl`, operadores, etc.              |
 | `sourceIPs`                                           | IP de origen de la petición                                                         |
 | `annotations["authorization.k8s.io/decision"]`        | `allow` o `deny`                                                                    |
+| `impersonatedUser.username`                            | Usuario impersonado, si aplica (común en limpieza automática de namespaces)          |
 | `annotations["authorization.k8s.io/reason"]`          | Motivo RBAC de la decisión                                                          |
 | `annotations["authentication.openshift.io/username"]` | Usuario en eventos del **oauth-server** (login)                                     |
 | `annotations["authentication.openshift.io/decision"]` | `allow`, `deny` o `error` en login                                                  |
@@ -70,7 +71,9 @@ El volumen de detalle lo define `spec.audit.profile` del recurso `APIServer`:
 oc get apiserver cluster -o jsonpath='{.spec.audit.profile}{"\n"}'
 ```
 
-OpenShift usa por defecto el perfil `**Default**`. La definición completa de cada perfil está en la [sección 12](#12-perfiles-de-auditoría).
+OpenShift usa por defecto el perfil **Default**. La definición completa de cada perfil está en la [sección 12](#12-perfiles-de-auditoría).
+
+> **Proyectos y namespaces:** operaciones como `oc new-project` y `oc delete project` generan eventos en **dos fases** (usuario + componente del sistema). Para atribuir la acción a una persona, no basta con filtrar `projects` o `namespaces` sin contexto; ver [sección 10](#10-creación-y-eliminación-de-proyectos).
 
 ---
 
@@ -181,6 +184,27 @@ oc adm node-logs $MASTER_NODE \
   | jq -c --arg u "$USUARIO_AUDITAR" 'select(.user.username == $u)'
 ```
 
+Para **proyectos**, el recurso depende de la operación:
+
+| Operación | Recurso a filtrar | API server recomendado |
+|-----------|-------------------|------------------------|
+| `oc new-project` (quién lo pidió) | `projectrequests` | `openshift-apiserver` o `kube-apiserver` |
+| `oc delete project` (quién lo eliminó) | `projects` | `kube-apiserver` o `openshift-apiserver` |
+
+```bash
+# Proyectos eliminados por el usuario
+oc adm node-logs $MASTER_NODE --path=openshift-apiserver/audit.log \
+  | jq -c --arg u "$USUARIO_AUDITAR" '
+      select(.user.username == $u and .verb == "delete" and .objectRef.resource == "projects")
+    '
+
+# Proyectos creados por el usuario (solicitud)
+oc adm node-logs $MASTER_NODE --path=openshift-apiserver/audit.log \
+  | jq -c --arg u "$USUARIO_AUDITAR" '
+      select(.user.username == $u and .verb == "create" and .objectRef.resource == "projectrequests")
+    '
+```
+
 ### 6.3. Inicios de sesión y acceso a la consola (OAuth server)
 
 ```bash
@@ -233,6 +257,8 @@ oc adm node-logs $MASTER_NODE --path=kube-apiserver/audit.log \
     '
 ```
 
+Para **proyectos nuevos** (`oc new-project`), el usuario aparece en `projectrequests`, no en `projects` (ese `create` lo hace `openshift-apiserver-sa`). Ver [sección 10.1](#101-creación-de-proyectos-oc-new-project).
+
 ### 7.2. Lectura / consulta (`get`, `list`, `watch`)
 
 ```bash
@@ -264,6 +290,8 @@ oc adm node-logs $MASTER_NODE --path=kube-apiserver/audit.log \
       select(.user.username == $u and .verb == "delete")
     '
 ```
+
+Para **proyectos** (`oc delete project`), filtra el recurso `projects`, no `namespaces`. Ver [sección 10.2](#102-eliminación-de-proyectos-oc-delete-project).
 
 ### 7.5. Combinar usuario + verbo + recurso
 
@@ -384,108 +412,178 @@ oc whoami   # admin
 
 ---
 
-## 10. Saber quién eliminó un proyecto
+## 10. Creación y eliminación de proyectos
 
-Eliminar un proyecto en OpenShift (`oc delete project <nombre>`) equivale a eliminar el **Namespace** subyacente. La auditoría registra esa operación principalmente en el **Kubernetes API server**.
+Las operaciones sobre proyectos en OpenShift registran **dos eventos**: uno del **usuario** y otro de un **componente del sistema** (`openshift-apiserver-sa`). Si el filtro no distingue el recurso correcto, verás la ServiceAccount en lugar de la persona.
 
-### 10.1. Dónde buscar
+### 10.1. Creación de proyectos (`oc new-project`)
 
+| Orden | Quién | Recurso | Qué representa |
+|-------|-------|---------|----------------|
+| 1 | **Usuario humano** | `projectrequests` | Quién solicitó el proyecto |
+| 2 | `openshift-apiserver-sa` | `projects` | Creación interna del objeto Project |
 
-| Acción                            | API server            | Recurso en el log            | Verbo    |
-| --------------------------------- | --------------------- | ---------------------------- | -------- |
-| `oc delete project mi-proyecto`   | `kube-apiserver`      | `namespaces` / `mi-proyecto` | `delete` |
-| `oc delete namespace mi-proyecto` | `kube-apiserver`      | `namespaces` / `mi-proyecto` | `delete` |
-| Eliminación vía API de Project    | `openshift-apiserver` | `projects` / `mi-proyecto`   | `delete` |
-
-
-En la práctica, la traza más fiable es el evento `delete` sobre `namespaces` en `kube-apiserver/audit.log`.
-
-### 10.2. Buscar por nombre del proyecto eliminado
-
-Sustituye `NOMBRE_PROYECTO` por el nombre del proyecto (namespace):
+Buscar quién creó un proyecto:
 
 ```bash
-export NOMBRE_PROYECTO=mi-proyecto
+export NOMBRE_PROYECTO=aplicacion-nucleo-datasystems
+export USUARIO_AUDITAR=user3
+
+for NODE in $(oc get nodes -l node-role.kubernetes.io/master= -o jsonpath='{.items[*].metadata.name}'); do
+  oc adm node-logs "$NODE" --path=openshift-apiserver/audit.log 2>/dev/null \
+    | jq -r --arg u "$USUARIO_AUDITAR" '
+        select(
+          .user.username == $u
+          and .verb == "create"
+          and .objectRef.resource == "projectrequests"
+        )
+        | "\(.requestReceivedTimestamp) usuario=\(.user.username) solicitud=\(.objectRef.name) agent=\(.userAgent) code=\(.responseStatus.code)"
+      '
+done
+```
+
+El nombre en `projectrequests` coincide con el del proyecto creado (`aplicacion-nucleo-datasystems` en el ejemplo de `user3`).
+
+### 10.2. Eliminación de proyectos (`oc delete project`)
+
+| Orden | Quién | Recurso | Qué representa |
+|-------|-------|---------|----------------|
+| 1 | **Usuario humano** | `projects` | Quién ejecutó la eliminación |
+| 2 | `openshift-apiserver-sa` | `namespaces` | Limpieza interna del namespace |
+
+Si el filtro solo busca `objectRef.resource == "namespaces"`, obtendrás la **ServiceAccount de OpenShift**, no quien ejecutó el comando.
+
+```
+usuario (oc delete project)
+    └── delete projects/aplicacion-nucleo-datasystems   ← buscar este evento
+            └── openshift-apiserver-sa
+                    └── delete namespaces/aplicacion-nucleo-datasystems   ← NO es el usuario
+```
+
+#### Dónde buscar
+
+| Acción | API server | Recurso en el log | Usuario en el log |
+|--------|------------|-------------------|-------------------|
+| `oc delete project <nombre>` | `kube-apiserver` o `openshift-apiserver` | **`projects`** | Usuario que ejecutó el comando |
+| Limpieza del namespace (automática) | `kube-apiserver` | `namespaces` | `openshift-apiserver-sa` |
+| `oc delete namespace <nombre>` | `kube-apiserver` | `namespaces` | Usuario que ejecutó el comando |
+| Eliminación por GitOps / operador | `kube-apiserver` o `openshift-apiserver` | `projects` o `namespaces` | Service account del componente |
+
+#### Comando recomendado
+
+```bash
+export NOMBRE_PROYECTO=aplicacion-nucleo-datasystems
 
 for NODE in $(oc get nodes -l node-role.kubernetes.io/master= -o jsonpath='{.items[*].metadata.name}'); do
   echo "########## $NODE ##########"
   oc adm node-logs "$NODE" --path=kube-apiserver/audit.log 2>/dev/null \
-    | jq -c --arg p "$NOMBRE_PROYECTO" '
+    | jq -r --arg p "$NOMBRE_PROYECTO" '
         select(
           .verb == "delete"
-          and .objectRef.resource == "namespaces"
           and .objectRef.name == $p
+          and (
+            .objectRef.resource == "projects"
+            or (
+              .objectRef.resource == "namespaces"
+              and (.user.username | startswith("system:") | not)
+            )
+          )
         )
+        | "\(.requestReceivedTimestamp) usuario=\(.user.username) recurso=\(.objectRef.resource) ip=\(.sourceIPs[0]) agent=\(.userAgent) code=\(.responseStatus.code)"
       '
 done
 ```
 
-Salida resumida con el usuario responsable:
+Variante directa (solo `projects`):
 
 ```bash
 for NODE in $(oc get nodes -l node-role.kubernetes.io/master= -o jsonpath='{.items[*].metadata.name}'); do
   oc adm node-logs "$NODE" --path=kube-apiserver/audit.log 2>/dev/null \
-    | jq -r --arg p "$NOMBRE_PROYECTO" '
+    | jq -c --arg p "$NOMBRE_PROYECTO" '
         select(
           .verb == "delete"
-          and .objectRef.resource == "namespaces"
+          and .objectRef.resource == "projects"
           and .objectRef.name == $p
         )
-        | "\(.requestReceivedTimestamp) usuario=\(.user.username) ip=\(.sourceIPs[0]) agent=\(.userAgent) code=\(.responseStatus.code)"
       '
 done
 ```
 
-### 10.3. Buscar todas las eliminaciones de proyectos de un usuario
+También puedes consultar `openshift-apiserver/audit.log` con el mismo filtro sobre `projects`.
+
+#### Ejemplo real: `aplicacion-nucleo-datasystems` eliminado por `user3`
+
+**Evento del usuario** (`oc delete project`):
+
+```json
+{
+  "verb": "delete",
+  "user": {"username": "user3"},
+  "requestURI": "/apis/project.openshift.io/v1/projects/aplicacion-nucleo-datasystems",
+  "objectRef": {
+    "resource": "projects",
+    "name": "aplicacion-nucleo-datasystems"
+  },
+  "responseStatus": {"code": 200},
+  "userAgent": "oc/4.17.0 (linux/amd64) kubernetes/f4525b8",
+  "requestReceivedTimestamp": "2026-06-24T02:07:51.026565Z",
+  "annotations": {
+    "authorization.k8s.io/decision": "allow",
+    "authorization.k8s.io/reason": "RBAC: allowed by RoleBinding \"admin/aplicacion-nucleo-datasystems\" of ClusterRole \"admin\" to User \"user3\""
+  }
+}
+```
+
+**Evento posterior del sistema** (no confundir con el usuario):
+
+```json
+{
+  "verb": "delete",
+  "user": {"username": "system:serviceaccount:openshift-apiserver:openshift-apiserver-sa"},
+  "requestURI": "/api/v1/namespaces/aplicacion-nucleo-datasystems",
+  "objectRef": {
+    "resource": "namespaces",
+    "name": "aplicacion-nucleo-datasystems"
+  },
+  "userAgent": "openshift-apiserver/v0.0.0 (linux/amd64) kubernetes/$Format"
+}
+```
+
+### 10.3. Listar proyectos creados o eliminados por un usuario
 
 ```bash
-export USUARIO_AUDITAR=admin
+export USUARIO_AUDITAR=user3
 
+# Proyectos eliminados
 for NODE in $(oc get nodes -l node-role.kubernetes.io/master= -o jsonpath='{.items[*].metadata.name}'); do
   oc adm node-logs "$NODE" --path=kube-apiserver/audit.log 2>/dev/null \
     | jq -r --arg u "$USUARIO_AUDITAR" '
         select(
           .user.username == $u
           and .verb == "delete"
-          and .objectRef.resource == "namespaces"
+          and .objectRef.resource == "projects"
         )
-        | "\(.requestReceivedTimestamp) proyecto=\(.objectRef.name) code=\(.responseStatus.code)"
+        | "\(.requestReceivedTimestamp) eliminó proyecto=\(.objectRef.name) code=\(.responseStatus.code)"
+      '
+done
+
+# Proyectos creados (solicitudes)
+for NODE in $(oc get nodes -l node-role.kubernetes.io/master= -o jsonpath='{.items[*].metadata.name}'); do
+  oc adm node-logs "$NODE" --path=openshift-apiserver/audit.log 2>/dev/null \
+    | jq -r --arg u "$USUARIO_AUDITAR" '
+        select(
+          .user.username == $u
+          and .verb == "create"
+          and .objectRef.resource == "projectrequests"
+        )
+        | "\(.requestReceivedTimestamp) creó proyecto=\(.objectRef.name) code=\(.responseStatus.code)"
       '
 done
 ```
 
-### 10.4. Ejemplo real: eliminación por `admin`
+### 10.4. Eliminaciones automáticas (operadores, GitOps)
 
-Evento registrado al eliminar el proyecto `produccion-app1`:
-
-```json
-{
-  "verb": "delete",
-  "user": {
-    "username": "admin",
-    "groups": ["cluster-admins", "system:authenticated:oauth", "system:authenticated"]
-  },
-  "requestURI": "/api/v1/namespaces/produccion-app1",
-  "objectRef": {
-    "resource": "namespaces",
-    "name": "produccion-app1"
-  },
-  "responseStatus": {"code": 200},
-  "sourceIPs": ["10.0.158.1"],
-  "userAgent": "curl/7.76.1",
-  "requestReceivedTimestamp": "2026-06-24T00:39:07.099220Z",
-  "annotations": {
-    "authorization.k8s.io/decision": "allow",
-    "authorization.k8s.io/reason": "RBAC: allowed by ClusterRoleBinding \"cluster-admin-admin\" of ClusterRole \"cluster-admin\" to User \"admin\""
-  }
-}
-```
-
-> Si eliminas un proyecto con `oc delete project <nombre>` como `admin`, el campo `user.username` del evento será `admin`. El `userAgent` indicará si fue `oc`, la consola web o una llamada REST (`curl`, scripts, operadores).
-
-### 10.5. Eliminaciones automáticas (operadores, GitOps)
-
-No todas las eliminaciones las ejecuta un usuario humano. Por ejemplo, Argo CD puede eliminar proyectos con una service account:
+Si quien elimina es un componente automatizado, el evento sobre `projects` mostrará una service account (no un usuario humano):
 
 ```json
 {
@@ -495,7 +593,7 @@ No todas las eliminaciones las ejecuta un usuario humano. Por ejemplo, Argo CD p
 }
 ```
 
-En esos casos, revisa `user.username` y `annotations["authorization.k8s.io/reason"]` para identificar el componente responsable.
+En ese caso el responsable es el componente indicado en `user.username`, no una persona.
 
 ---
 
@@ -534,13 +632,15 @@ Notas adicionales (según documentación de Red Hat):
 2. Los eventos del OpenShift OAuth server se registran solo a nivel de metadatos.
 3. Se pueden definir reglas personalizadas en `spec.audit.customRules` por grupo de autenticación; se evalúan de arriba a abajo y la primera coincidencia aplica.
 
-Con el perfil `**Default`** es posible identificar quién accedió, creó, modificó o eliminó recursos (incluidos proyectos), aunque no se almacene el YAML completo enviado en la petición.
+Con el perfil **Default** es posible identificar quién accedió, creó, modificó o eliminó recursos (incluidos proyectos), aunque no se almacene el YAML completo enviado en la petición.
 
 ---
 
 ## 13. Resumen de comandos rápidos
 
 ```bash
+oc login -u admin
+
 # Perfil actual
 oc get apiserver cluster -o jsonpath='{.spec.audit.profile}{"\n"}'
 
@@ -549,17 +649,27 @@ oc get nodes -l node-role.kubernetes.io/master= -o name
 
 export MASTER_NODE=ip-10-0-107-138.us-east-2.compute.internal
 export USUARIO_AUDITAR=user21
-export NOMBRE_PROYECTO=mi-proyecto
+export NOMBRE_PROYECTO=aplicacion-nucleo-datasystems
 
-# Filtrar por usuario
+# Filtrar por usuario (recursos dentro de namespaces: pods, configmaps, etc.)
 oc adm node-logs $MASTER_NODE --path=kube-apiserver/audit.log \
   | jq -c --arg u "$USUARIO_AUDITAR" 'select(.user.username == $u)'
 
-# Quién eliminó un proyecto
-oc adm node-logs $MASTER_NODE --path=kube-apiserver/audit.log \
-  | jq -c --arg p "$NOMBRE_PROYECTO" '
-      select(.verb == "delete" and .objectRef.resource == "namespaces" and .objectRef.name == $p)
-    '
+# Quién eliminó un proyecto → recurso projects (no namespaces del sistema)
+for NODE in $(oc get nodes -l node-role.kubernetes.io/master= -o jsonpath='{.items[*].metadata.name}'); do
+  oc adm node-logs "$NODE" --path=kube-apiserver/audit.log 2>/dev/null \
+    | jq -c --arg p "$NOMBRE_PROYECTO" '
+        select(.verb == "delete" and .objectRef.resource == "projects" and .objectRef.name == $p)
+      '
+done
+
+# Quién creó un proyecto → recurso projectrequests (no projects del sistema)
+for NODE in $(oc get nodes -l node-role.kubernetes.io/master= -o jsonpath='{.items[*].metadata.name}'); do
+  oc adm node-logs "$NODE" --path=openshift-apiserver/audit.log 2>/dev/null \
+    | jq -c --arg p "$NOMBRE_PROYECTO" '
+        select(.verb == "create" and .objectRef.resource == "projectrequests" and .objectRef.name == $p)
+      '
+done
 
 # Login en consola
 oc adm node-logs $MASTER_NODE --path=oauth-server/audit.log \
